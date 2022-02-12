@@ -1,6 +1,0 @@
-scriptlist
-https://github.com/marzzzello/mpv_thumbnail_script ,mpv_thumbnail_script
-https://github.com/bloc97/Anime4K ,Anime4K
-https://github.com/CogentRedTester/mpv-scroll-list ,mpv-scroll-list
-https://github.com/zxhzxhz/mpv-chapters , chapters list with tab key
-https://github.com/mhtvsSFrpHdE/AnimeAnyK-mpv , anime4kautoscript
