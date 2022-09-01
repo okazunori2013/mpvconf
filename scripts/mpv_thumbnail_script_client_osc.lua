@@ -15,9 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ]]--
 --[[
-    mpv_thumbnail_script.lua 0.4.8 - commit e732ffb (branch master)
+    mpv_thumbnail_script.lua 0.4.9 - commit 0ab5d6f (branch pr23)
     https://github.com/TheAMM/mpv_thumbnail_script
-    Built on 2022-07-06 01:25:24
+    Built on 2022-07-11 17:55:53
 ]]--
 local assdraw = require 'mp.assdraw'
 local msg = require 'mp.msg'
@@ -792,6 +792,9 @@ local thumbnailer_options = {
     -- Try to grab the raw stream and disable ytdl for the mpv subcalls
     -- Much faster than passing the url to ytdl again, but may cause problems with some sites
     remote_direct_stream = true,
+
+    -- Enable storyboards (requires yt-dlp in PATH). Currently only supports YouTube
+    storyboard_enable = true,
 }
 
 read_options(thumbnailer_options, SCRIPT_NAME)
@@ -821,6 +824,9 @@ local Thumbnailer = {
         worker_input_path = nil,
         -- Extra options for the workers
         worker_extra = {},
+
+        -- Storyboard urls
+        storyboard_url = nil,
     },
     -- Set in register_client
     worker_register_timeout = nil,
@@ -836,6 +842,7 @@ function Thumbnailer:clear_state()
     self.state.finished_thumbnails = 0
     self.state.thumbnails = {}
     self.state.worker_extra = {}
+    self.state.storyboard_url = nil
 end
 
 
@@ -870,6 +877,40 @@ function Thumbnailer:on_video_change(params)
         if not self.state.ready then
             self:update_state()
         end
+    end
+end
+
+-- Check for storyboards existance with yt-dlp and call back (may take a long time)
+function Thumbnailer:check_storyboard_async(callback)
+    if thumbnailer_options.storyboard_enable and self.state.is_remote then
+        msg.info("Trying to get storyboard info...")
+        local sb_cmd = {"yt-dlp", "--format", "sb0", "--dump-json",
+                        "--extractor-args", "youtube:skip=hls,dash,translated_subs", -- yt speedup
+                        "--", mp.get_property_native("path")}
+
+        mp.command_native_async({name="subprocess", args=sb_cmd, capture_stdout=true}, function(success, sb_json)
+            if success and sb_json.status == 0 then
+                local sb = utils.parse_json(sb_json.stdout)
+                if sb ~= nil and sb.duration and sb.width and sb.height and #sb.fragments > 1 then
+                    self.state.storyboard_url = sb.fragments
+                    self.state.thumbnail_size = {w=sb.width, h=sb.height}
+                    -- estimate the count of thumbnails
+                    -- assume 5x5 atlas (sb0)
+                    self.state.thumbnail_delta = sb.fragments[1].duration / (5*5) -- first atlas is always full
+                    self.state.thumbnail_count = math.floor(sb.duration / self.state.thumbnail_delta)
+                    -- Prefill individual thumbnail states
+                    self.state.thumbnails = {}
+                    for i = 1, self.state.thumbnail_count do
+                        self.state.thumbnails[i] = -1
+                    end
+                    msg.info("Storyboard info acquired! " .. self.state.thumbnail_count)
+                    self.state.available = true
+                end
+            end
+            callback()
+        end)
+    else
+        callback()
     end
 end
 
@@ -1072,17 +1113,19 @@ function Thumbnailer:register_client()
     end)
 
     -- Notify workers to generate thumbnails when video loads/changes
-    -- This will be executed after the on_video_change (because it's registered after it)
-    mp.observe_property("video-dec-params", "native", function()
-        local duration = mp.get_property_native("duration")
-        local max_duration = thumbnailer_options.autogenerate_max_duration
+    mp.observe_property("video-dec-params", "native", function(name, params)
+        Thumbnailer:on_video_change(params)
+        self:check_storyboard_async(function()
+            local duration = mp.get_property_native("duration")
+            local max_duration = thumbnailer_options.autogenerate_max_duration
 
-        if duration ~= nil and self.state.available and thumbnailer_options.autogenerate then
-            -- Notify if autogenerate is on and video is not too long
-            if duration < max_duration or max_duration == 0 then
-                self:start_worker_jobs()
+            if duration ~= nil and self.state.available and thumbnailer_options.autogenerate then
+                -- Notify if autogenerate is on and video is not too long
+                if duration < max_duration or max_duration == 0 then
+                    self:start_worker_jobs()
+                end
             end
-        end
+        end)
     end)
 
     local thumb_script_key = not thumbnailer_options.disable_keybinds and "T" or nil
@@ -1227,7 +1270,6 @@ function Thumbnailer:start_worker_jobs()
 end
 
 mp.register_event("start-file", function() Thumbnailer:on_start_file() end)
-mp.observe_property("video-dec-params", "native", function(name, params) Thumbnailer:on_video_change(params) end)
 local assdraw = require 'mp.assdraw'
 local msg = require 'mp.msg'
 local opt = require 'mp.options'
