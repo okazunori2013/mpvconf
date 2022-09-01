@@ -2,7 +2,7 @@
 [mpv](https://github.com/mpv-player/mpv)のconfig+シェダーファイル
 |script|date|ver|
 |----|----|----|
-|[mpv_thumbnail_script](https://github.com/marzzzello/mpv_thumbnail_script)|2022-07-09|0.4.9|
+|[mpv_thumbnail_script](https://github.com/marzzzello/mpv_thumbnail_script)|2022-09-02|0.5.0|
 |[Anime4K](https://github.com/bloc97/Anime4K)|2022-02-14|4.0.1|
 |[mpv-scroll-list](https://github.com/CogentRedTester/mpv-scroll-list)|2022-08-06|-|
 |[chapters list with tab key](https://github.com/zxhzxhz/mpv-chapters)|2022-02-14|-|
