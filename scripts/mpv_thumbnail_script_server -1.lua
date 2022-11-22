@@ -15,9 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ]]--
 --[[
-    mpv_thumbnail_script.lua 0.4.9 - commit 0ab5d6f (branch pr23)
+    mpv_thumbnail_script.lua 0.5.1 - commit 100667f (branch master)
     https://github.com/TheAMM/mpv_thumbnail_script
-    Built on 2022-07-11 17:55:55
+    Built on 2022-11-03 16:39:12
 ]]--
 local assdraw = require 'mp.assdraw'
 local msg = require 'mp.msg'
@@ -342,7 +342,7 @@ function round_rect(ass, x0, y0, x1, y1, rtl, rtr, rbr, rbl)
 end
 local SCRIPT_NAME = "mpv_thumbnail_script"
 
-local default_cache_base = ON_WINDOWS and os.getenv("TEMP") or "/tmp/"
+local default_cache_base = ON_WINDOWS and os.getenv("TEMP") or (os.getenv("XDG_CACHE_HOME") or "/tmp/")
 
 local thumbnailer_options = {
     -- The thumbnail directory
@@ -461,8 +461,12 @@ local thumbnailer_options = {
     -- Much faster than passing the url to ytdl again, but may cause problems with some sites
     remote_direct_stream = true,
 
-    -- Enable storyboards (requires yt-dlp in PATH). Currently only supports YouTube
+    -- Enable storyboards (requires yt-dlp in PATH). Currently only supports YouTube and Twitch VoDs
     storyboard_enable = true,
+    -- Max thumbnails for storyboards. It only skips processing some of the downloaded thumbnails and doesn't make it much faster
+    storyboard_max_thumbnail_count = 800,
+    -- Most storyboard thumbnails are 160x90. Enabling this allows upscaling them up to thumbnail_height
+    storyboard_upscale = false,
 }
 
 read_options(thumbnailer_options, SCRIPT_NAME)
@@ -523,7 +527,9 @@ function create_thumbnail_mpv(file_path, timestamp, size, output_path, options)
         -- Optionally disable subtitles
         (thumbnailer_options.mpv_no_sub and "--no-sub" or nil),
 
-        (options.no_scale == nil and ("--vf=scale=%d:%d"):format(size.w, size.h) or nil),
+        (options.relative_scale == nil
+                and ("--vf=scale=%d:%d"):format(size.w, size.h)
+                or ("--vf=scale=iw*%d:ih*%d"):format(size.w, size.h)),
 
         "--vf-add=format=bgra",
         "--of=rawvideo",
@@ -537,7 +543,7 @@ end
 function create_thumbnail_ffmpeg(file_path, timestamp, size, output_path, options)
     options = options or {}
 
-    local ffmpeg_command = skip_nil({
+    local ffmpeg_command = {
         "ffmpeg",
         "-loglevel", "quiet",
         "-noaccurate_seek",
@@ -547,13 +553,17 @@ function create_thumbnail_ffmpeg(file_path, timestamp, size, output_path, option
         "-frames:v", "1",
         "-an",
 
-        (options.no_scale == nil and "-vf" or nil), (options.no_scale == nil and ("scale=%d:%d"):format(size.w, size.h) or nil),
+        "-vf",
+        (options.relative_scale == nil
+                and ("scale=%d:%d"):format(size.w, size.h)
+                or ("scale=iw*%d:ih*%d"):format(size.w, size.h)),
+
         "-c:v", "rawvideo",
         "-pix_fmt", "bgra",
         "-f", "rawvideo",
 
         "-y", output_path
-    })
+    }
     return utils.subprocess({args=ffmpeg_command})
 end
 
@@ -593,24 +603,26 @@ function check_output(ret, output_path, is_mpv)
 end
 
 -- split cols x N atlas in BGRA format into many thumbnail files
-function split_atlas(atlas_path, cols, thumbnail_size, template, offset)
+function split_atlas(atlas_path, cols, thumbnail_size, output_name)
     local atlas = io.open(atlas_path, "rb")
     local atlas_filesize = atlas:seek("end")
     local atlas_pictures = math.floor(atlas_filesize / (4 * thumbnail_size.w * thumbnail_size.h))
+    local stride = 4 * thumbnail_size.w * math.min(cols, atlas_pictures)
     for pic = 0, atlas_pictures-1 do
-        local idx = offset + pic
         local x_start = (pic % cols) * thumbnail_size.w
         local y_start = math.floor(pic / cols) * thumbnail_size.h
-        local thumb_file = io.open(template:format(idx), "wb")
-        local stride = 4 * thumbnail_size.w * math.min(cols, atlas_pictures)
-        for line = 0, thumbnail_size.h - 1 do
-            atlas:seek("set", 4 * x_start + (y_start + line) * stride)
-            local data = atlas:read(thumbnail_size.w * 4)
-            if data ~= nil then
-                thumb_file:write(data)
+        local filename = output_name(pic)
+        if filename ~= nil then
+            local thumb_file = io.open(filename, "wb")
+            for line = 0, thumbnail_size.h - 1 do
+                atlas:seek("set", 4 * x_start + (y_start + line) * stride)
+                local data = atlas:read(thumbnail_size.w * 4)
+                if data ~= nil then
+                    thumb_file:write(data)
+                end
             end
+            thumb_file:close()
         end
-        thumb_file:close()
     end
     atlas:close()
 end
@@ -641,7 +653,7 @@ function do_worker_job(state_json_string, frames_json_string)
     local file_duration = mp.get_property_native("duration")
     local file_path = thumb_state.worker_input_path
 
-    if thumb_state.is_remote and thumb_state.storyboard_url == nil then
+    if thumb_state.is_remote and thumb_state.storyboard == nil then
         if (thumbnail_func == create_thumbnail_ffmpeg) then
             msg.warn("Thumbnailing remote path, falling back on mpv.")
         end
@@ -680,17 +692,26 @@ function do_worker_job(state_json_string, frames_json_string)
 
         if need_thumbnail_generation then
             local success
-            if thumb_state.storyboard_url ~= nil then
+            if thumb_state.storyboard ~= nil then
                 -- get atlas and then split it into thumbnails
-                local rows = 5
-                local cols = 5
-                local atlas_idx = math.floor(thumb_idx/(cols*rows))
+                local rows = thumb_state.storyboard.rows
+                local cols = thumb_state.storyboard.cols
+                local div = thumb_state.storyboard.divisor
+                local atlas_idx = math.floor(thumb_idx * div /(cols*rows))
                 local atlas_path = thumb_state.thumbnail_template:format(atlas_idx) .. ".atlas"
-                local url = thumb_state.storyboard_url[atlas_idx+1].url
-                local ret = thumbnail_func(url, 0, thumb_state.thumbnail_size, atlas_path, { no_scale=true })
+                local url = thumb_state.storyboard.fragments[atlas_idx+1].url
+                if url == nil then
+                    url = thumb_state.storyboard.fragment_base_url .. "/" .. thumb_state.storyboard.fragments[atlas_idx+1].path
+                end
+                local ret = thumbnail_func(url, 0, { w=thumb_state.storyboard.scale, h=thumb_state.storyboard.scale }, atlas_path, { relative_scale=true })
                 success = check_output(ret, atlas_path, thumbnail_func == create_thumbnail_mpv)
                 if success then
-                    split_atlas(atlas_path, cols, thumb_state.thumbnail_size, thumb_state.thumbnail_template, atlas_idx * cols * rows)
+                    split_atlas(atlas_path, cols, thumb_state.thumbnail_size, function(idx)
+                        if (atlas_idx * cols * rows + idx) % div ~= 0 then
+                            return nil
+                        end
+                        return thumb_state.thumbnail_template:format(math.floor((atlas_idx * cols * rows + idx) / div))
+                    end)
                     os.remove(atlas_path)
                 end
             else

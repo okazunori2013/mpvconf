@@ -15,9 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ]]--
 --[[
-    mpv_thumbnail_script.lua 0.4.9 - commit 0ab5d6f (branch pr23)
+    mpv_thumbnail_script.lua 0.5.1 - commit 100667f (branch master)
     https://github.com/TheAMM/mpv_thumbnail_script
-    Built on 2022-07-11 17:55:53
+    Built on 2022-11-03 16:39:10
 ]]--
 local assdraw = require 'mp.assdraw'
 local msg = require 'mp.msg'
@@ -674,7 +674,7 @@ end)()
 
 local SCRIPT_NAME = "mpv_thumbnail_script"
 
-local default_cache_base = ON_WINDOWS and os.getenv("TEMP") or "/tmp/"
+local default_cache_base = ON_WINDOWS and os.getenv("TEMP") or (os.getenv("XDG_CACHE_HOME") or "/tmp/")
 
 local thumbnailer_options = {
     -- The thumbnail directory
@@ -793,8 +793,12 @@ local thumbnailer_options = {
     -- Much faster than passing the url to ytdl again, but may cause problems with some sites
     remote_direct_stream = true,
 
-    -- Enable storyboards (requires yt-dlp in PATH). Currently only supports YouTube
+    -- Enable storyboards (requires yt-dlp in PATH). Currently only supports YouTube and Twitch VoDs
     storyboard_enable = true,
+    -- Max thumbnails for storyboards. It only skips processing some of the downloaded thumbnails and doesn't make it much faster
+    storyboard_max_thumbnail_count = 800,
+    -- Most storyboard thumbnails are 160x90. Enabling this allows upscaling them up to thumbnail_height
+    storyboard_upscale = false,
 }
 
 read_options(thumbnailer_options, SCRIPT_NAME)
@@ -826,7 +830,7 @@ local Thumbnailer = {
         worker_extra = {},
 
         -- Storyboard urls
-        storyboard_url = nil,
+        storyboard = nil,
     },
     -- Set in register_client
     worker_register_timeout = nil,
@@ -842,7 +846,7 @@ function Thumbnailer:clear_state()
     self.state.finished_thumbnails = 0
     self.state.thumbnails = {}
     self.state.worker_extra = {}
-    self.state.storyboard_url = nil
+    self.state.storyboard = nil
 end
 
 
@@ -863,7 +867,7 @@ function Thumbnailer:on_thumb_ready(index)
 end
 
 function Thumbnailer:on_thumb_progress(index)
-    self.state.thumbnails[index] = math.max(self.state.thumbnails[index], 0)
+    self.state.thumbnails[index] = (self.state.thumbnails[index] == 1) and 1 or 0
 end
 
 function Thumbnailer:on_start_file()
@@ -876,6 +880,17 @@ function Thumbnailer:on_video_change(params)
     if params ~= nil then
         if not self.state.ready then
             self:update_state()
+            self:check_storyboard_async(function()
+                local duration = mp.get_property_native("duration")
+                local max_duration = thumbnailer_options.autogenerate_max_duration
+
+                if duration ~= nil and self.state.available and thumbnailer_options.autogenerate then
+                    -- Notify if autogenerate is on and video is not too long
+                    if duration < max_duration or max_duration == 0 then
+                        self:start_worker_jobs()
+                    end
+                end
+            end)
         end
     end
 end
@@ -884,20 +899,52 @@ end
 function Thumbnailer:check_storyboard_async(callback)
     if thumbnailer_options.storyboard_enable and self.state.is_remote then
         msg.info("Trying to get storyboard info...")
-        local sb_cmd = {"yt-dlp", "--format", "sb0", "--dump-json",
+        local sb_cmd = {"yt-dlp", "--format", "sb0", "--dump-json", "--no-playlist",
                         "--extractor-args", "youtube:skip=hls,dash,translated_subs", -- yt speedup
                         "--", mp.get_property_native("path")}
 
         mp.command_native_async({name="subprocess", args=sb_cmd, capture_stdout=true}, function(success, sb_json)
             if success and sb_json.status == 0 then
                 local sb = utils.parse_json(sb_json.stdout)
-                if sb ~= nil and sb.duration and sb.width and sb.height and #sb.fragments > 1 then
-                    self.state.storyboard_url = sb.fragments
-                    self.state.thumbnail_size = {w=sb.width, h=sb.height}
-                    -- estimate the count of thumbnails
-                    -- assume 5x5 atlas (sb0)
-                    self.state.thumbnail_delta = sb.fragments[1].duration / (5*5) -- first atlas is always full
-                    self.state.thumbnail_count = math.floor(sb.duration / self.state.thumbnail_delta)
+                if sb ~= nil and sb.duration and sb.width and sb.height and sb.fragments and #sb.fragments > 0 then
+                    self.state.storyboard = {}
+                    self.state.storyboard.fragments = sb.fragments
+                    self.state.storyboard.fragment_base_url = sb.fragment_base_url
+                    self.state.storyboard.rows = sb.rows or 5
+                    self.state.storyboard.cols = sb.columns or 5
+
+                    if sb.fps then
+                        self.state.thumbnail_count = math.floor(sb.fps * sb.duration + 0.5) -- round
+                        -- hack: youtube always adds 1 black frame at the end...
+                        if sb.extractor == "youtube" then
+                            self.state.thumbnail_count = self.state.thumbnail_count - 1
+                        end
+                    else
+                        -- estimate the count of thumbnails
+                        -- assume first atlas is always full
+                        self.state.thumbnail_delta = sb.fragments[1].duration / (self.state.storyboard.rows*self.state.storyboard.cols)
+                        self.state.thumbnail_count = math.floor(sb.duration / self.state.thumbnail_delta)
+                    end
+
+                    -- Storyboard upscaling factor
+                    local scale = 1
+                    if thumbnailer_options.storyboard_upscale then
+                        -- BUG: sometimes mpv crashes when asked for non-integer scaling and BGRA format (something related to zimg?)
+                        -- use integer scaling for now
+                        scale = math.max(1, math.floor(thumbnailer_options.thumbnail_height / sb.height))
+                    end
+                    self.state.thumbnail_size = {w=sb.width*scale, h=sb.height*scale}
+                    self.state.storyboard.scale = scale
+
+                    local divisor = 1 -- only save every n-th thumbnail
+                    if thumbnailer_options.storyboard_max_thumbnail_count then
+                        divisor = math.ceil(self.state.thumbnail_count / thumbnailer_options.storyboard_max_thumbnail_count)
+                    end
+                    self.state.storyboard.divisor = divisor
+                    self.state.thumbnail_count = math.floor(self.state.thumbnail_count / divisor)
+                    self.state.thumbnail_delta = sb.duration / self.state.thumbnail_count
+
+
                     -- Prefill individual thumbnail states
                     self.state.thumbnails = {}
                     for i = 1, self.state.thumbnail_count do
@@ -1114,18 +1161,7 @@ function Thumbnailer:register_client()
 
     -- Notify workers to generate thumbnails when video loads/changes
     mp.observe_property("video-dec-params", "native", function(name, params)
-        Thumbnailer:on_video_change(params)
-        self:check_storyboard_async(function()
-            local duration = mp.get_property_native("duration")
-            local max_duration = thumbnailer_options.autogenerate_max_duration
-
-            if duration ~= nil and self.state.available and thumbnailer_options.autogenerate then
-                -- Notify if autogenerate is on and video is not too long
-                if duration < max_duration or max_duration == 0 then
-                    self:start_worker_jobs()
-                end
-            end
-        end)
+        self:on_video_change(params)
     end)
 
     local thumb_script_key = not thumbnailer_options.disable_keybinds and "T" or nil
@@ -1315,6 +1351,7 @@ local user_opts = {
     tooltipborder = 1,          -- border of tooltip in bottom/topbar
     timetotal = false,          -- display total time instead of remaining time?
     timems = false,             -- display timecodes with milliseconds?
+    tcspace = 100,              -- timecode spacing (compensate font size estimation)
     visibility = "auto",        -- only used at init to set visibility_mode(...)
     boxmaxchars = 80,           -- title crop threshold for box layout
     boxvideo = false,           -- apply osc_param.video_margins to video
@@ -1325,6 +1362,7 @@ local user_opts = {
     chapters_osd = true,        -- whether to show chapters OSD on next/prev
     playlist_osd = true,        -- whether to show playlist OSD on next/prev
     chapter_fmt = "Chapter: %s", -- chapter print format for seekbar-hover. "no" to disable
+    unicodeminus = false,       -- whether to use the Unicode minus sign character
 }
 
 -- read options from config and command-line
@@ -2982,6 +3020,11 @@ function bar_layout(direction)
     local padY = 3
     local buttonW = 27
     local tcW = (state.tc_ms) and 170 or 110
+    if user_opts.tcspace >= 50 and user_opts.tcspace <= 200 then
+        -- adjust our hardcoded font size estimation
+        tcW = tcW * user_opts.tcspace / 100
+    end
+
     local tsW = 90
     local minW = (buttonW + padX)*5 + (tcW + padX)*4 + (tsW + padX)*2
 
@@ -3233,6 +3276,8 @@ function update_options(list)
     update_duration_watch()
     request_init()
 end
+
+local UNICODE_MINUS = string.char(0xe2, 0x88, 0x92)  -- UTF-8 for U+2212 MINUS SIGN
 
 -- OSC INIT
 function osc_init()
@@ -3563,10 +3608,11 @@ function osc_init()
     ne.visible = (mp.get_property_number("duration", 0) > 0)
     ne.content = function ()
         if (state.rightTC_trem) then
+            local minus = user_opts.unicodeminus and UNICODE_MINUS or "-"
             if state.tc_ms then
-                return ("-"..mp.get_property_osd("playtime-remaining/full"))
+                return (minus..mp.get_property_osd("playtime-remaining/full"))
             else
-                return ("-"..mp.get_property_osd("playtime-remaining"))
+                return (minus..mp.get_property_osd("playtime-remaining"))
             end
         else
             if state.tc_ms then
@@ -4089,7 +4135,11 @@ function tick()
 
         -- render idle message
         msg.trace("idle message")
-        local icon_x, icon_y = 320 - 26, 140
+        local _, _, display_aspect = mp.get_osd_size()
+        local display_h = 360
+        local display_w = display_h * display_aspect
+        -- logo is rendered at 2^(6-1) = 32 times resolution with size 1800x1800
+        local icon_x, icon_y = (display_w - 1800 / 32) / 2, 140
         local line_prefix = ("{\\rDefault\\an7\\1a&H00&\\bord0\\shad0\\pos(%f,%f)}"):format(icon_x, icon_y)
 
         local ass = assdraw.ass_new()
@@ -4111,11 +4161,11 @@ function tick()
 
         if user_opts.idlescreen then
             ass:new_event()
-            ass:pos(320, icon_y+65)
+            ass:pos(display_w / 2, icon_y + 65)
             ass:an(8)
             ass:append("Drop files or URLs to play here.")
         end
-        set_osd(640, 360, ass.text)
+        set_osd(display_w, display_h, ass.text)
 
         if state.showhide_enabled then
             mp.disable_key_bindings("showhide")
