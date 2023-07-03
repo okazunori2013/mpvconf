@@ -6,4 +6,4 @@
 |[Anime4K](https://github.com/bloc97/Anime4K)|2022-02-14|4.0.1|
 |[mpv-scroll-list](https://github.com/CogentRedTester/mpv-scroll-list)|2022-08-06|72a2396|
 |[chapters list with tab key](https://github.com/zxhzxhz/mpv-chapters)|2022-02-14|5c69e3d|
-|[anime4kautoscript](https://github.com/mhtvsSFrpHdE/AnimeAnyK-mpv)|2022-02-14|1.1.8|
+|[anime4kautoscript](https://github.com/mhtvsSFrpHdE/AnimeAnyK-mpv)|2022-04-28|1.2|
